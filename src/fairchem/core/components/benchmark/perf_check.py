@@ -198,6 +198,13 @@ def run_inference(
     data = AtomicData.from_ase(system.atoms, task_name=system.task_name)
 
     is_cuda = device == "cuda" and torch.cuda.is_available()
+
+    def _push_nvtx_range(label: str) -> bool:
+        if is_cuda:
+            torch.cuda.nvtx.range_push(label)
+            return True
+        return False
+
     if is_cuda:
         torch.cuda.reset_peak_memory_stats()
 
@@ -205,18 +212,28 @@ def run_inference(
     warmup_time = 0.0
     if warmup_iters > 0:
         warmup_start = time.perf_counter()
-        for _ in range(warmup_iters):
-            predictor.predict(data)
-            if is_cuda:
-                torch.cuda.synchronize()
+        for i in range(warmup_iters):
+            range_pushed = _push_nvtx_range(f"inference_warmup_iter_{i}")
+            try:
+                predictor.predict(data)
+                if is_cuda:
+                    torch.cuda.synchronize()
+            finally:
+                if range_pushed:
+                    torch.cuda.nvtx.range_pop()
         warmup_time = time.perf_counter() - warmup_start
 
     # Timed iterations
     timed_start = time.perf_counter()
-    for _ in range(timed_iters):
-        preds = predictor.predict(data)
-        if is_cuda:
-            torch.cuda.synchronize()
+    for i in range(timed_iters):
+        range_pushed = _push_nvtx_range(f"inference_timed_iter_{i}")
+        try:
+            preds = predictor.predict(data)
+            if is_cuda:
+                torch.cuda.synchronize()
+        finally:
+            if range_pushed:
+                torch.cuda.nvtx.range_pop()
     wall_time = time.perf_counter() - timed_start
 
     # Extract predictions

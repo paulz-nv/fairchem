@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import logging
@@ -59,15 +60,49 @@ class BenchmarkTrainCallback(Callback):
         self.step_times: list[float] = []
         self.peak_memory_mb: float = 0.0
         self._step_start_time: float | None = None
+        self._nvtx_range_pushed: bool = False
+        self._eval_nvtx_range_pushed: bool = False
+        self._cuda_profiler = None
+        self._cuda_profiler_started = False
 
     def on_train_start(self, state, unit) -> None:
+        if torch.cuda.is_available():
+            try:
+                self._cuda_profiler = ctypes.CDLL("libcudart.so")
+            except OSError as e:
+                logger.warning("Failed to load libcudart.so for profiler start: %s", e)
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
     def on_train_step_start(self, state, unit) -> None:
         self._step_start_time = time.perf_counter()
+        self._nvtx_range_pushed = False
+        if torch.cuda.is_available():
+            step_idx = len(self.step_times)
+            # Skip step 0 to avoid capturing compile/warmup overhead.
+            if (
+                step_idx >= 1
+                and self._cuda_profiler is not None
+                and not self._cuda_profiler_started
+            ):
+                start_ret = self._cuda_profiler.cudaProfilerStart()
+                if start_ret == 0:
+                    self._cuda_profiler_started = True
+                else:
+                    logger.warning(
+                        "cudaProfilerStart failed with return code %s", start_ret
+                    )
+            num_atoms = getattr(unit, "current_num_atoms", None)
+            step_label = f"train_step_{step_idx}"
+            if num_atoms is not None:
+                step_label += f"_atoms_{num_atoms}"
+            torch.cuda.nvtx.range_push(step_label)
+            self._nvtx_range_pushed = True
 
     def on_train_step_end(self, state, unit) -> None:
+        if self._nvtx_range_pushed:
+            torch.cuda.nvtx.range_pop()
+            self._nvtx_range_pushed = False
         if self._step_start_time is not None:
             self.step_times.append(time.perf_counter() - self._step_start_time)
         if unit.last_loss is not None:
@@ -78,7 +113,28 @@ class BenchmarkTrainCallback(Callback):
         if torch.cuda.is_available():
             self.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
 
+    def on_eval_step_start(self, state, unit) -> None:
+        self._eval_nvtx_range_pushed = False
+        if torch.cuda.is_available():
+            step_idx = unit.eval_progress.num_steps_completed
+            step_label = f"eval_step_{step_idx}"
+            num_atoms = getattr(unit, "current_eval_num_atoms", None)
+            if num_atoms is not None:
+                step_label += f"_atoms_{num_atoms}"
+            torch.cuda.nvtx.range_push(step_label)
+            self._eval_nvtx_range_pushed = True
+
+    def on_eval_step_end(self, state, unit) -> None:
+        if self._eval_nvtx_range_pushed:
+            torch.cuda.nvtx.range_pop()
+            self._eval_nvtx_range_pushed = False
+
     def on_train_end(self, state, unit) -> None:
+        if self._cuda_profiler_started and self._cuda_profiler is not None:
+            stop_ret = self._cuda_profiler.cudaProfilerStop()
+            if stop_ret != 0:
+                logger.warning("cudaProfilerStop failed with return code %s", stop_ret)
+            self._cuda_profiler_started = False
         results = {
             "losses": self.losses,
             "grad_norms": self.grad_norms,

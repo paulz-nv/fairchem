@@ -10,9 +10,10 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Sequence
 
 import numpy as np
 import torch
@@ -67,6 +68,26 @@ UNIT_RESUME_CONFIG = "resume.yaml"
 
 # this represents the inference only checkpoint generated at each checkpoint
 UNIT_INFERENCE_CHECKPOINT = "inference_ckpt.pt"
+_NVTX_SYNC_ENABLED = os.getenv("FAIRCHEM_NVTX_SYNC", "0") == "1"
+
+
+@contextmanager
+def _record_cuda_nvtx_range(name: str) -> Iterator[None]:
+    """
+    Record a phase in both PyTorch profiler and CUDA NVTX.
+    """
+    nvtx_range_pushed = False
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        nvtx_range_pushed = True
+    try:
+        with record_function(name):
+            yield
+    finally:
+        if nvtx_range_pushed:
+            if _NVTX_SYNC_ENABLED:
+                torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
 
 
 @dataclass
@@ -553,6 +574,11 @@ class MLIPTrainEvalUnit(
 
         self.last_loss = None
         self.last_grad_norm = None
+        self.current_num_atoms: int | None = None
+        self.current_eval_num_atoms: int | None = None
+        self._has_force_task = any(
+            task.property == "forces" or "forces" in task.name for task in self.tasks
+        )
         self.num_params = sum(p.numel() for p in model.parameters())
         if self.logger:
             self.logger.log_summary(
@@ -628,6 +654,24 @@ class MLIPTrainEvalUnit(
         self.scheduler = None
         self.lazy_state_location = None
 
+    def get_next_train_batch(
+        self,
+        state: State,
+        data_iter: Iterator[AtomicData],
+    ) -> AtomicData:
+        data = super().get_next_train_batch(state, data_iter)
+        self.current_num_atoms = int(data.natoms.sum().item())
+        return data
+
+    def get_next_eval_batch(
+        self,
+        state: State,
+        data_iter: Iterator[AtomicData],
+    ) -> AtomicData:
+        data = super().get_next_eval_batch(state, data_iter)
+        self.current_eval_num_atoms = int(data.natoms.sum().item())
+        return data
+
     def load_scheduler(self, train_dataloader_size: int) -> int:
         self.scheduler = self.cosine_lr_scheduler_fn(
             n_iters_per_epoch=train_dataloader_size,
@@ -701,13 +745,16 @@ class MLIPTrainEvalUnit(
                 enabled=self.autocast_enabled,
                 dtype=self.autocast_dtype,
             ):
-                with record_function("forward"):
+                with _record_cuda_nvtx_range("forward"):
                     pred = self.model.forward(batch_on_device)
-                with record_function("compute_loss"):
+                with _record_cuda_nvtx_range("compute_loss"):
                     loss_dict = compute_loss(self.tasks, pred, batch_on_device)
             scalar_loss = sum(loss_dict.values())
             self.optimizer.zero_grad()
-            with record_function("backward"):
+            with (
+                _record_cuda_nvtx_range("gradient-backward"),
+                record_function("backward"),
+            ):
                 scalar_loss.backward()
 
             if self.debug_checksums_save_path:

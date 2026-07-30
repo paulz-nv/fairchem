@@ -83,16 +83,17 @@ def get_pbc_distances(
 ):
     row, col = edge_index
 
-    distance_vectors = pos[row] - pos[col]
+    with torch.cuda.nvtx.range("get_pbc_distances"):
+        distance_vectors = pos[row] - pos[col]
 
-    # correct for pbc
-    neighbors = neighbors.to(cell.device)
-    cell = torch.repeat_interleave(cell, neighbors, dim=0)
-    offsets = cell_offsets.to(dtype=cell.dtype).view(-1, 1, 3).bmm(cell).view(-1, 3)
-    distance_vectors += offsets
+        # correct for pbc
+        neighbors = neighbors.to(cell.device)
+        cell = torch.repeat_interleave(cell, neighbors, dim=0)
+        offsets = cell_offsets.to(dtype=cell.dtype).view(-1, 1, 3).bmm(cell).view(-1, 3)
+        distance_vectors += offsets
 
-    # compute distances
-    distances = distance_vectors.norm(dim=-1)
+        # compute distances   
+        distances = distance_vectors.norm(dim=-1)
 
     # redundancy: remove zero distances
     nonzero_idx = torch.arange(len(distances), device=distances.device)[distances != 0]

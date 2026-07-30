@@ -41,6 +41,21 @@ def _get_dataset_to_tasks_map(tasks: Sequence[Task]) -> dict[str, list[Task]]:
     return dict(dset_to_tasks_map)
 
 
+def _run_backbone_with_nvtx(
+    backbone: BackboneInterface,
+    data: AtomicData,
+    device: str | None,
+) -> dict[str, torch.Tensor]:
+    """Run backbone forward with an NVTX range on CUDA."""
+    if device == "cuda":
+        torch.cuda.nvtx.range_push("hydra_backbone_forward")
+        try:
+            return backbone(data)
+        finally:
+            torch.cuda.nvtx.range_pop()
+    return backbone(data)
+
+
 class HeadInterface(metaclass=ABCMeta):
     @property
     def use_amp(self):
@@ -422,7 +437,7 @@ class HydraModel(nn.Module, HydraInterfaceMixin):
             ), f"all inputs must be on the same device, found the following devices {device_from_tensors}"
             self.device = device_from_tensors.pop()
 
-        emb = self.backbone(data)
+        emb = _run_backbone_with_nvtx(self.backbone, data, self.device)
         # Predict all output properties for all structures in the batch for now.
         out = {}
         for k in self.output_heads:
@@ -500,7 +515,7 @@ class HydraModelV2(nn.Module, HydraInterfaceMixin):
             ), f"all inputs must be on the same device, found the following devices {device_from_tensors}"
             self.device = device_from_tensors.pop()
 
-        emb = self.backbone(data)
+        emb = _run_backbone_with_nvtx(self.backbone, data, self.device)
         # Predict all output properties for all structures in the batch for now.
         out = {}
         for k in self.output_heads:

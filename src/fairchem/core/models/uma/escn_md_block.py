@@ -8,7 +8,8 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 import torch.nn as nn
@@ -30,6 +31,20 @@ from fairchem.core.models.uma.nn.so3_layers import SO3_Linear
 if TYPE_CHECKING:
     from fairchem.core.models.uma.common.so3 import CoefficientMapping, SO3_Grid
     from fairchem.core.models.uma.nn.execution_backends import ExecutionBackend
+
+
+@contextmanager
+def _record_cuda_nvtx_range(name: str) -> Iterator[None]:
+    nvtx_range_pushed = False
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        nvtx_range_pushed = True
+    try:
+        with record_function(name):
+            yield
+    finally:
+        if nvtx_range_pushed:
+            torch.cuda.nvtx.range_pop()
 
 
 def set_mole_ac_start_index(module: nn.Module, index: int) -> None:
@@ -186,7 +201,7 @@ class Edgewise(torch.nn.Module):
         # work properly with MoLE together
         set_mole_ac_start_index(self, ac_mole_start_idx)
 
-        with record_function("SO2Conv"):
+        with _record_cuda_nvtx_range("SO2Conv"):
             x_message = self.backend.node_to_edge_wigner_permute(
                 x_full, edge_index, wigner
             )
@@ -360,9 +375,10 @@ class eSCNMD_Block(torch.nn.Module):
         x = self.norm_1(x)
 
         if sys_node_embedding is not None:
-            x[:, 0, :] = x[:, 0, :] + sys_node_embedding
+            with _record_cuda_nvtx_range("AddSystemEmbeddingToL0"):
+                x[:, 0, :] = x[:, 0, :] + sys_node_embedding
 
-        with record_function("edgewise"):
+        with _record_cuda_nvtx_range("edgewise"):
             x = self.edge_wise(
                 x,
                 x_edge,
@@ -377,7 +393,7 @@ class eSCNMD_Block(torch.nn.Module):
         x_res = x
         x = self.norm_2(x)
 
-        with record_function("atomwise"):
+        with _record_cuda_nvtx_range("atomwise"):
             x = self.atom_wise(x)
             x = x + x_res
 

@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Iterator, Literal
 
 import torch
 import torch.nn as nn
@@ -77,6 +78,23 @@ if TYPE_CHECKING:
 
 ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE = 1024 * 128
 AUTO_EDGE_CHUNK_FRACTION = 0.05
+
+
+@contextmanager
+def _record_cuda_nvtx_range(name: str) -> Iterator[None]:
+    """
+    Record a phase in both PyTorch profiler and CUDA NVTX.
+    """
+    nvtx_range_pushed = False
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        nvtx_range_pushed = True
+    try:
+        with record_function(name):
+            yield
+    finally:
+        if nvtx_range_pushed:
+            torch.cuda.nvtx.range_pop()
 
 
 @dataclass
@@ -540,7 +558,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         self, edge_distance_vecs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.use_quaternion_wigner:
-            with record_function("obtain rotmat wigner quaternion"):
+            with _record_cuda_nvtx_range("obtain rotmat wigner quaternion"):
                 wigner, wigner_inv = axis_angle_wigner_hybrid(
                     edge_distance_vecs,
                     self.lmax,
@@ -554,7 +572,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 for l in range(self.lmax + 1)
             ]
 
-            with record_function("obtain rotmat wigner original"):
+            with _record_cuda_nvtx_range("obtain rotmat wigner original"):
                 euler_angles = init_edge_rot_euler_angles(edge_distance_vecs)
                 wigner = eulers_to_wigner(
                     euler_angles,
@@ -570,7 +588,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         return wigner, wigner_inv
 
     def csd_embedding(self, charge, spin, dataset):
-        with record_function("charge spin dataset embeddings"):
+        with _record_cuda_nvtx_range("charge spin dataset embeddings"):
             # Add charge, spin, and dataset embeddings
             chg_emb = self.charge_embedding(charge)
             spin_emb = self.spin_embedding(spin)
@@ -695,10 +713,14 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             if self.regress_config.stress:
                 data_dict["cell"].requires_grad_(True)
 
-        with record_function("generate_graph"):
+        with _record_cuda_nvtx_range("GenerateGraphEdgeVectors"):
             graph_dict = self._generate_graph(data_dict)
+        if torch.cuda.is_available():
+            num_atoms = data_dict["atomic_numbers_full"].shape[0]
+            num_edges = graph_dict["edge_index"].shape[1]
+            torch.cuda.nvtx.mark(f"batch_atoms_{num_atoms}_edges_{num_edges}")
 
-        with record_function("obtain wigner"):
+        with _record_cuda_nvtx_range("PrepareWigner"):
             wigner, wigner_inv = self._get_rotmat_and_wigner(
                 graph_dict["edge_distance_vec"],
             )
@@ -717,7 +739,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         ###############################################################
 
         # Init per node representations using an atomic number based embedding
-        with record_function("atom embedding"):
+        with _record_cuda_nvtx_range("atom embedding"):
             x_message = torch.zeros(
                 data_dict["atomic_numbers"].shape[0],
                 self.sph_feature_size,
@@ -741,12 +763,11 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         self.log_MOLE_stats()
 
         # edge degree embedding
-        with record_function("edge embedding"):
-            dist_scaled = graph_dict["edge_distance"] / self.cutoff
-            edge_envelope = self.envelope(dist_scaled).reshape(-1, 1, 1)
-            edge_distance_embedding = self.distance_expansion(
-                graph_dict["edge_distance"]
-            )
+        with _record_cuda_nvtx_range("edge embedding"):
+            with _record_cuda_nvtx_range("GaussianSmearing"):
+                edge_distance_embedding = self.distance_expansion(
+                    graph_dict["edge_distance"]
+                )
             source_embedding = self.source_embedding(
                 data_dict["atomic_numbers_full"][graph_dict["edge_index"][0]]
             )
@@ -759,7 +780,10 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             )
 
             # Pre-fuse envelope into wigner_inv
-            wigner_inv_envelope = wigner_inv * edge_envelope
+            with _record_cuda_nvtx_range("PrepareWignerInvEnvelope"):
+                dist_scaled = graph_dict["edge_distance"] / self.cutoff
+                edge_envelope = self.envelope(dist_scaled).reshape(-1, 1, 1)
+                wigner_inv_envelope = wigner_inv * edge_envelope
 
             x_message = self.edge_degree_embedding(
                 x_message,
@@ -776,11 +800,11 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         # Get edge embeddings for each layer
         # General backend: raw x_edge (rad_func computed inside SO2_Convolution)
         # Fast backends: precomputed radials
-        with record_function("layer_radial_emb"):
+        with _record_cuda_nvtx_range("layer_radial_emb"):
             x_edge_per_layer = self.backend.get_layer_radial_emb(x_edge, self)
 
         for i in range(self.num_layers):
-            with record_function(f"message passing {i}"):
+            with _record_cuda_nvtx_range(f"message passing {i}"):
                 x_message = self.blocks[i](
                     x_message,
                     x_edge_per_layer[i],
@@ -1009,14 +1033,15 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
         outputs = {}
 
         # Use shared energy computation from parent class
-        energy, energy_part = compute_energy(
-            emb,
-            self.energy_block,
-            data["batch"],
-            len(data["natoms"]),
-            natoms=data["natoms"],
-            reduce=self.reduce,
-        )
+        with _record_cuda_nvtx_range("compute_energy"):
+            energy, energy_part = compute_energy(
+                emb,
+                self.energy_block,
+                data["batch"],
+                len(data["natoms"]),
+                natoms=data["natoms"],
+                reduce=self.reduce,
+            )
 
         outputs[energy_key] = {"energy": energy} if self.wrap_property else energy
 
@@ -1031,18 +1056,24 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
         create_graph = self.training or self.regress_config.hessian
 
         if self.regress_config.stress and not self.regress_config.direct_stress:
-            forces, stress = compute_forces_and_stress(
-                energy_part,
-                data["pos"],
-                data["cell"],
-                batch=data["batch_full"],  # use batch_full to work with GP reduction
-                training=create_graph,
-            )
+            with _record_cuda_nvtx_range("compute_forces_and_stress"):
+                forces, stress = compute_forces_and_stress(
+                    energy_part,
+                    data["pos"],
+                    data["cell"],
+                    batch=data[
+                        "batch_full"
+                    ],  # use batch_full to work with GP reduction
+                    training=create_graph,
+                )
             # TODO should we assume gradient forces always when stress is requested?
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
             outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
         elif self.regress_config.forces and not self.regress_config.direct_forces:
-            forces = compute_forces(energy_part, data["pos"], training=self.training)
+            with _record_cuda_nvtx_range("compute_forces"):
+                forces = compute_forces(
+                    energy_part, data["pos"], training=self.training
+                )
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
         else:
             forces = None
@@ -1126,9 +1157,10 @@ class Linear_Force_Head(nn.Module, HeadInterface):
         l0_l1_embedding = get_l_component_range(emb["node_embedding"], l_min=0, l_max=1)
         forces_output = self.linear(l0_l1_embedding)
 
-        # Extract L=1 (vector) component from the output
-        forces = get_l_component_range(forces_output, l_min=1, l_max=1)
-        forces = forces.view(-1, 3).contiguous()
+        with _record_cuda_nvtx_range("L1CoefficientsToForces"):
+            # Extract L=1 (vector) component from the output
+            forces = get_l_component_range(forces_output, l_min=1, l_max=1)
+            forces = forces.view(-1, 3).contiguous()
 
         if gp_utils.initialized():
             forces = gp_utils.gather_from_model_parallel_region(

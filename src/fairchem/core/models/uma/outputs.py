@@ -7,11 +7,27 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
-from typing import Literal
+from contextlib import contextmanager
+from typing import Iterator, Literal
 
 import torch
+from torch.profiler import record_function
 
 from fairchem.core.common import gp_utils
+
+
+@contextmanager
+def _record_cuda_nvtx_range(name: str) -> Iterator[None]:
+    nvtx_range_pushed = False
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        nvtx_range_pushed = True
+    try:
+        with record_function(name):
+            yield
+    finally:
+        if nvtx_range_pushed:
+            torch.cuda.nvtx.range_pop()
 
 
 def get_l_component_range(x: torch.Tensor, l_min: int, l_max: int) -> torch.Tensor:
@@ -116,11 +132,12 @@ def compute_energy(
     ).squeeze(1)
     node_energy = energy_block(scalar_embedding)
     node_energy_flat = node_energy.view(-1)
-    energy, energy_part = reduce_node_to_system(
-        node_energy_flat,
-        batch,
-        num_systems,
-    )
+    with _record_cuda_nvtx_range("ReduceNodeToSystemEnergy"):
+        energy, energy_part = reduce_node_to_system(
+            node_energy_flat,
+            batch,
+            num_systems,
+        )
 
     if reduce == "sum":
         pass
@@ -206,7 +223,8 @@ def compute_forces_and_stress(
     # Using already-reduced gradients here would cause double-reduction
     # since reduce_node_to_system also calls reduce_from_model_parallel_region.
     pos_virial_per_atom = grads[0].unsqueeze(2) * pos.unsqueeze(1)  # [N, 3, 3]
-    pos_virial, _ = reduce_node_to_system(pos_virial_per_atom, batch, num_systems)
+    with _record_cuda_nvtx_range("ReduceNodeToSystemStress"):
+        pos_virial, _ = reduce_node_to_system(pos_virial_per_atom, batch, num_systems)
 
     # Now all-reduce gradients for forces and cell_virial
     if gp_utils.initialized():

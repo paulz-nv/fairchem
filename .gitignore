@@ -144,3 +144,4 @@ package-lock.json
 bulks.pkl
 # MyST build outputs
 _build
+fairchem_runs/
