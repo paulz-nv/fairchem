@@ -78,14 +78,22 @@ if TYPE_CHECKING:
 
 ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE = 1024 * 128
 AUTO_EDGE_CHUNK_FRACTION = 0.05
+_NVTX_SYNC_ENABLED = os.getenv("FAIRCHEM_NVTX_SYNC", "0") == "1"
 
 
 @contextmanager
-def _record_cuda_nvtx_range(name: str) -> Iterator[None]:
+def _record_cuda_nvtx_range(
+    name: str, synchronize: bool = False
+) -> Iterator[None]:
     """
     Record a phase in both PyTorch profiler and CUDA NVTX.
     """
     nvtx_range_pushed = False
+    should_synchronize = (
+        synchronize and _NVTX_SYNC_ENABLED and torch.cuda.is_available()
+    )
+    if should_synchronize:
+        torch.cuda.synchronize()
     if torch.cuda.is_available():
         torch.cuda.nvtx.range_push(name)
         nvtx_range_pushed = True
@@ -94,6 +102,8 @@ def _record_cuda_nvtx_range(name: str) -> Iterator[None]:
             yield
     finally:
         if nvtx_range_pushed:
+            if should_synchronize:
+                torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
 
@@ -716,9 +726,12 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         with _record_cuda_nvtx_range("GenerateGraphEdgeVectors"):
             graph_dict = self._generate_graph(data_dict)
         if torch.cuda.is_available():
+            num_systems = len(data_dict["natoms"])
             num_atoms = data_dict["atomic_numbers_full"].shape[0]
             num_edges = graph_dict["edge_index"].shape[1]
-            torch.cuda.nvtx.mark(f"batch_atoms_{num_atoms}_edges_{num_edges}")
+            torch.cuda.nvtx.mark(
+                f"batch_systems_{num_systems}_atoms_{num_atoms}_edges_{num_edges}"
+            )
 
         with _record_cuda_nvtx_range("PrepareWigner"):
             wigner, wigner_inv = self._get_rotmat_and_wigner(
@@ -749,8 +762,8 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             )
             x_message[:, 0, :] = self.sphere_embedding(data_dict["atomic_numbers"])
 
-        sys_node_embedding = csd_mixed_emb[data_dict["batch"]]
-        x_message[:, 0, :] = x_message[:, 0, :] + sys_node_embedding
+            sys_node_embedding = csd_mixed_emb[data_dict["batch"]]
+            x_message[:, 0, :] = x_message[:, 0, :] + sys_node_embedding
 
         ###
         # Hook to allow MOLE
@@ -1056,24 +1069,33 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
         create_graph = self.training or self.regress_config.hessian
 
         if self.regress_config.stress and not self.regress_config.direct_stress:
-            with _record_cuda_nvtx_range("compute_forces_and_stress"):
-                forces, stress = compute_forces_and_stress(
-                    energy_part,
-                    data["pos"],
-                    data["cell"],
-                    batch=data[
-                        "batch_full"
-                    ],  # use batch_full to work with GP reduction
-                    training=create_graph,
-                )
+            range_name = (
+                "AutogradForcesAndStress.total."
+                f"create_graph_{int(create_graph)}"
+            )
+            with _record_cuda_nvtx_range(range_name, synchronize=True):
+                with _record_cuda_nvtx_range("compute_forces_and_stress"):
+                    forces, stress = compute_forces_and_stress(
+                        energy_part,
+                        data["pos"],
+                        data["cell"],
+                        batch=data[
+                            "batch_full"
+                        ],  # use batch_full to work with GP reduction
+                        training=create_graph,
+                    )
             # TODO should we assume gradient forces always when stress is requested?
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
             outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
         elif self.regress_config.forces and not self.regress_config.direct_forces:
-            with _record_cuda_nvtx_range("compute_forces"):
-                forces = compute_forces(
-                    energy_part, data["pos"], training=self.training
-                )
+            range_name = (
+                f"AutogradForces.total.create_graph_{int(self.training)}"
+            )
+            with _record_cuda_nvtx_range(range_name, synchronize=True):
+                with _record_cuda_nvtx_range("compute_forces"):
+                    forces = compute_forces(
+                        energy_part, data["pos"], training=self.training
+                    )
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
         else:
             forces = None

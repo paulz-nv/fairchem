@@ -94,6 +94,9 @@ class BenchmarkTrainCallback(Callback):
                     )
             num_atoms = getattr(unit, "current_num_atoms", None)
             step_label = f"train_step_{step_idx}"
+            num_systems = getattr(unit, "current_num_systems", None)
+            if num_systems is not None:
+                step_label += f"_systems_{num_systems}"
             if num_atoms is not None:
                 step_label += f"_atoms_{num_atoms}"
             torch.cuda.nvtx.range_push(step_label)
@@ -118,6 +121,9 @@ class BenchmarkTrainCallback(Callback):
         if torch.cuda.is_available():
             step_idx = unit.eval_progress.num_steps_completed
             step_label = f"eval_step_{step_idx}"
+            num_systems = getattr(unit, "current_eval_num_systems", None)
+            if num_systems is not None:
+                step_label += f"_systems_{num_systems}"
             num_atoms = getattr(unit, "current_eval_num_atoms", None)
             if num_atoms is not None:
                 step_label += f"_atoms_{num_atoms}"

@@ -575,7 +575,9 @@ class MLIPTrainEvalUnit(
         self.last_loss = None
         self.last_grad_norm = None
         self.current_num_atoms: int | None = None
+        self.current_num_systems: int | None = None
         self.current_eval_num_atoms: int | None = None
+        self.current_eval_num_systems: int | None = None
         self._has_force_task = any(
             task.property == "forces" or "forces" in task.name for task in self.tasks
         )
@@ -661,6 +663,7 @@ class MLIPTrainEvalUnit(
     ) -> AtomicData:
         data = super().get_next_train_batch(state, data_iter)
         self.current_num_atoms = int(data.natoms.sum().item())
+        self.current_num_systems = int(data.natoms.numel())
         return data
 
     def get_next_eval_batch(
@@ -670,6 +673,7 @@ class MLIPTrainEvalUnit(
     ) -> AtomicData:
         data = super().get_next_eval_batch(state, data_iter)
         self.current_eval_num_atoms = int(data.natoms.sum().item())
+        self.current_eval_num_systems = int(data.natoms.numel())
         return data
 
     def load_scheduler(self, train_dataloader_size: int) -> int:

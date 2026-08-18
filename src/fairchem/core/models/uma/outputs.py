@@ -166,15 +166,17 @@ def compute_forces(
     Returns:
         Forces tensor of shape [N, 3].
     """
-    (grad,) = torch.autograd.grad(
-        energy_part.sum(),
-        pos,
-        create_graph=training,
-    )
-    forces = torch.neg(grad)
+    with _record_cuda_nvtx_range("AutogradForces.first_derivative"):
+        (grad,) = torch.autograd.grad(
+            energy_part.sum(),
+            pos,
+            create_graph=training,
+        )
+    with _record_cuda_nvtx_range("AutogradForces.postprocess"):
+        forces = torch.neg(grad)
 
-    if gp_utils.initialized():
-        forces = gp_utils.reduce_from_model_parallel_region(forces)
+        if gp_utils.initialized():
+            forces = gp_utils.reduce_from_model_parallel_region(forces)
 
     return forces
 
@@ -210,36 +212,40 @@ def compute_forces_and_stress(
         - forces: Shape [N, 3].
         - stress: Shape [num_systems, 9] (flattened 3x3 tensor).
     """
-    grads = torch.autograd.grad(
-        [energy_part.sum()],
-        [pos, cell],
-        create_graph=training,
-    )
+    with _record_cuda_nvtx_range("AutogradForcesAndStress.first_derivative"):
+        grads = torch.autograd.grad(
+            [energy_part.sum()],
+            [pos, cell],
+            create_graph=training,
+        )
 
-    num_systems = cell.shape[0]
+    with _record_cuda_nvtx_range("AutogradForcesAndStress.postprocess"):
+        num_systems = cell.shape[0]
 
-    # Compute pos_virial from LOCAL (unreduced) gradients so that
-    # reduce_node_to_system performs the single correct GP all-reduce.
-    # Using already-reduced gradients here would cause double-reduction
-    # since reduce_node_to_system also calls reduce_from_model_parallel_region.
-    pos_virial_per_atom = grads[0].unsqueeze(2) * pos.unsqueeze(1)  # [N, 3, 3]
-    with _record_cuda_nvtx_range("ReduceNodeToSystemStress"):
-        pos_virial, _ = reduce_node_to_system(pos_virial_per_atom, batch, num_systems)
+        # Compute pos_virial from LOCAL (unreduced) gradients so that
+        # reduce_node_to_system performs the single correct GP all-reduce.
+        # Using already-reduced gradients here would cause double-reduction
+        # since reduce_node_to_system also calls reduce_from_model_parallel_region.
+        pos_virial_per_atom = grads[0].unsqueeze(2) * pos.unsqueeze(1)  # [N, 3, 3]
+        with _record_cuda_nvtx_range("ReduceNodeToSystemStress"):
+            pos_virial, _ = reduce_node_to_system(
+                pos_virial_per_atom, batch, num_systems
+            )
 
-    # Now all-reduce gradients for forces and cell_virial
-    if gp_utils.initialized():
-        grad_pos = gp_utils.reduce_from_model_parallel_region(grads[0])
-        grad_cell = gp_utils.reduce_from_model_parallel_region(grads[1])
-    else:
-        grad_pos, grad_cell = grads[0], grads[1]
+        # Now all-reduce gradients for forces and cell_virial
+        if gp_utils.initialized():
+            grad_pos = gp_utils.reduce_from_model_parallel_region(grads[0])
+            grad_cell = gp_utils.reduce_from_model_parallel_region(grads[1])
+        else:
+            grad_pos, grad_cell = grads[0], grads[1]
 
-    forces = torch.neg(grad_pos)
-    cell_virial = cell.mT @ grad_cell  # [B, 3, 3]
+        forces = torch.neg(grad_pos)
+        cell_virial = cell.mT @ grad_cell  # [B, 3, 3]
 
-    virial = (pos_virial + pos_virial.mT + cell_virial + cell_virial.mT) / 2
-    volume = torch.det(cell).abs().unsqueeze(-1)
-    stress = virial / volume.view(-1, 1, 1)
-    stress = stress.view(-1, 9)
+        virial = (pos_virial + pos_virial.mT + cell_virial + cell_virial.mT) / 2
+        volume = torch.det(cell).abs().unsqueeze(-1)
+        stress = virial / volume.view(-1, 1, 1)
+        stress = stress.view(-1, 9)
 
     return forces, stress
 
