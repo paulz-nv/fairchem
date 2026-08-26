@@ -82,9 +82,7 @@ _NVTX_SYNC_ENABLED = os.getenv("FAIRCHEM_NVTX_SYNC", "0") == "1"
 
 
 @contextmanager
-def _record_cuda_nvtx_range(
-    name: str, synchronize: bool = False
-) -> Iterator[None]:
+def _record_cuda_nvtx_range(name: str, synchronize: bool = False) -> Iterator[None]:
     """
     Record a phase in both PyTorch profiler and CUDA NVTX.
     """
@@ -725,6 +723,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
 
         with _record_cuda_nvtx_range("GenerateGraphEdgeVectors"):
             graph_dict = self._generate_graph(data_dict)
+        data_dict["generated_nedges"] = graph_dict.get("neighbors", data_dict["nedges"])
         if torch.cuda.is_available():
             num_systems = len(data_dict["natoms"])
             num_atoms = data_dict["atomic_numbers_full"].shape[0]
@@ -1070,32 +1069,33 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
 
         if self.regress_config.stress and not self.regress_config.direct_stress:
             range_name = (
-                "AutogradForcesAndStress.total."
-                f"create_graph_{int(create_graph)}"
+                "AutogradForcesAndStress.total." f"create_graph_{int(create_graph)}"
             )
-            with _record_cuda_nvtx_range(range_name, synchronize=True):
-                with _record_cuda_nvtx_range("compute_forces_and_stress"):
-                    forces, stress = compute_forces_and_stress(
-                        energy_part,
-                        data["pos"],
-                        data["cell"],
-                        batch=data[
-                            "batch_full"
-                        ],  # use batch_full to work with GP reduction
-                        training=create_graph,
-                    )
+            with (
+                _record_cuda_nvtx_range(range_name, synchronize=True),
+                _record_cuda_nvtx_range("compute_forces_and_stress"),
+            ):
+                forces, stress = compute_forces_and_stress(
+                    energy_part,
+                    data["pos"],
+                    data["cell"],
+                    batch=data[
+                        "batch_full"
+                    ],  # use batch_full to work with GP reduction
+                    training=create_graph,
+                )
             # TODO should we assume gradient forces always when stress is requested?
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
             outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
         elif self.regress_config.forces and not self.regress_config.direct_forces:
-            range_name = (
-                f"AutogradForces.total.create_graph_{int(self.training)}"
-            )
-            with _record_cuda_nvtx_range(range_name, synchronize=True):
-                with _record_cuda_nvtx_range("compute_forces"):
-                    forces = compute_forces(
-                        energy_part, data["pos"], training=self.training
-                    )
+            range_name = f"AutogradForces.total.create_graph_{int(self.training)}"
+            with (
+                _record_cuda_nvtx_range(range_name, synchronize=True),
+                _record_cuda_nvtx_range("compute_forces"),
+            ):
+                forces = compute_forces(
+                    energy_part, data["pos"], training=self.training
+                )
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
         else:
             forces = None

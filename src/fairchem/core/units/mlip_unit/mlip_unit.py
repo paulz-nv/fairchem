@@ -815,6 +815,7 @@ class MLIPTrainEvalUnit(
                 "train/lr": self.scheduler.get_lr()[0],
                 "train/step": step,
                 "train/epoch": epoch,
+                "train/step_time_s": float(time_delta),
                 "train/samples_per_second(approx)": num_samples_local
                 * self.dp_world_size
                 / float(time_delta),
@@ -829,7 +830,20 @@ class MLIPTrainEvalUnit(
                 self.logger.log(log_dict, step=step, commit=True)
 
             if step % self.print_every == 0:
-                logging.info(log_dict)
+                atoms_per_system = [int(value) for value in data.natoms.tolist()]
+                edges_per_system = [
+                    int(value)
+                    for value in data.get("generated_nedges", data.nedges).tolist()
+                ]
+                logging.info(
+                    {
+                        **log_dict,
+                        "train/num_systems": num_samples_local,
+                        "train/edges_per_system": edges_per_system,
+                        "train/total_atoms": num_atoms_local,
+                        "train/atoms_per_system": atoms_per_system,
+                    }
+                )
 
             self.scheduler.step()
 

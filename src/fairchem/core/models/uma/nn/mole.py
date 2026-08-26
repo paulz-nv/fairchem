@@ -9,7 +9,9 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -20,6 +22,9 @@ from torch.nn import functional as F
 #   * "fairchem_cpp" -> the compiled fairchem_cpp.ops.segment_mm extension
 # Both are optional at import time; the concrete op is bound once by
 # ``replace_linear_with_MOLE`` and passed in as ``segment_mm_fn``.
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 # Canonical values accepted by ``moe_layer_type``. ``"dgl"`` is intentionally
 # NOT accepted: it historically meant fairchem_cpp but was later repurposed to
@@ -47,6 +52,22 @@ def normalize_mole_layer_type(name: str) -> str:
 def is_moledgl_backend(name: str) -> bool:
     """True if ``name`` selects a ``MOLEDGL`` (cuBLAS/C++) backend."""
     return name in _MOLEDGL_BACKENDS
+
+
+@contextmanager
+def _record_mole_nvtx_range(name: str, enabled: bool) -> Iterator[None]:
+    """
+    Mark MOLE CUDA work for Nsight Systems.
+    """
+    if not enabled:
+        yield
+        return
+
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def interval_intersection(interval1, interval2):
@@ -136,26 +157,36 @@ class MOLEDGL(torch.nn.Module):
         self.segment_mm_fn = segment_mm_fn
 
     def forward(self, x):
-        with torch.autocast(device_type=self.weights.device.type, enabled=False):
-            weights = torch.einsum(
-                "eoi, be->bio",
-                self.weights,
-                self.global_mole_tensors.expert_mixing_coefficients,
-            )
-        x_shape = x.shape
-        if x.ndim == 2:
-            r = self.segment_mm_fn(x, weights, self.global_mole_tensors.mole_sizes)
-        elif x.ndim == 3:
-            r = self.segment_mm_fn(
-                x.reshape(-1, x_shape[-1]),
-                weights,
-                self.global_mole_tensors.mole_sizes * x_shape[1],
-            ).reshape(*x_shape[:-1], -1)
-        else:
-            raise ValueError("x.ndim not in (2,3) not allowed")
-        if self.bias is not None:
-            r += self.bias
-        return r
+        nvtx_enabled = x.is_cuda
+        with _record_mole_nvtx_range("MOLE", nvtx_enabled):
+            with _record_mole_nvtx_range(
+                "MOLE::expert_weight_blend", nvtx_enabled
+            ), torch.autocast(
+                device_type=self.weights.device.type,
+                enabled=False,
+            ):
+                weights = torch.einsum(
+                    "eoi, be->bio",
+                    self.weights,
+                    self.global_mole_tensors.expert_mixing_coefficients,
+                )
+            x_shape = x.shape
+            with _record_mole_nvtx_range("MOLE::segment_mm", nvtx_enabled):
+                if x.ndim == 2:
+                    r = self.segment_mm_fn(
+                        x, weights, self.global_mole_tensors.mole_sizes
+                    )
+                elif x.ndim == 3:
+                    r = self.segment_mm_fn(
+                        x.reshape(-1, x_shape[-1]),
+                        weights,
+                        self.global_mole_tensors.mole_sizes * x_shape[1],
+                    ).reshape(*x_shape[:-1], -1)
+                else:
+                    raise ValueError("x.ndim not in (2,3) not allowed")
+            if self.bias is not None:
+                r += self.bias
+            return r
 
 
 class MOLE(torch.nn.Module):
@@ -199,40 +230,50 @@ class MOLE(torch.nn.Module):
         return linear
 
     def forward(self, x):
-        with torch.autocast(device_type=self.weights.device.type, enabled=False):
-            weights = torch.einsum(
-                "eoi, be->boi",
-                self.weights,
-                self.global_mole_tensors.expert_mixing_coefficients,
-            )
+        nvtx_enabled = x.is_cuda
+        with _record_mole_nvtx_range("MOLE", nvtx_enabled):
+            with _record_mole_nvtx_range(
+                "MOLE::expert_weight_blend", nvtx_enabled
+            ), torch.autocast(
+                device_type=self.weights.device.type,
+                enabled=False,
+            ):
+                weights = torch.einsum(
+                    "eoi, be->boi",
+                    self.weights,
+                    self.global_mole_tensors.expert_mixing_coefficients,
+                )
 
-        out = []
-        ac_start_idx = self.global_mole_tensors.ac_start_idx
-        assert len(self.global_mole_tensors.mole_sizes) > 0
-        # TODO: precompute these if needed but they should be small and on cpu
-        start_idxs = [0] + torch.cumsum(
-            self.global_mole_tensors.mole_sizes, dim=0
-        ).tolist()
-        mole_intervals = list(zip(start_idxs, start_idxs[1:]))
+            out = []
+            ac_start_idx = self.global_mole_tensors.ac_start_idx
+            assert len(self.global_mole_tensors.mole_sizes) > 0
+            # TODO: precompute these if needed but they should be small and on cpu
+            start_idxs = [0] + torch.cumsum(
+                self.global_mole_tensors.mole_sizes, dim=0
+            ).tolist()
+            mole_intervals = list(zip(start_idxs, start_idxs[1:]))
 
-        # Because activation checkpointing can chunk the inputs, we need to only compute
-        # the mole_size intervals that overlap with the current chunks
-        # for example if mole_sizes = [10,10,15]
-        # start_idxs -> [0,10,20,35]
-        # mole_intervals -> [(0,10),(10,20),(20,35)]
-        # if the input segment is (5,15) then we compute the following 2 segments
-        # (5,10),(10,15)
-        input_segment = (ac_start_idx, ac_start_idx + x.shape[0])
+            # Because activation checkpointing can chunk the inputs, we need to only compute
+            # the mole_size intervals that overlap with the current chunks
+            # for example if mole_sizes = [10,10,15]
+            # start_idxs -> [0,10,20,35]
+            # mole_intervals -> [(0,10),(10,20),(20,35)]
+            # if the input segment is (5,15) then we compute the following 2 segments
+            # (5,10),(10,15)
+            input_segment = (ac_start_idx, ac_start_idx + x.shape[0])
 
-        for n, mole_segment in enumerate(mole_intervals):
-            interval_overlap = interval_intersection(input_segment, mole_segment)
-            if interval_overlap is not None:
-                start = interval_overlap[0] - ac_start_idx
-                end = interval_overlap[1] - ac_start_idx
-                out.append(F.linear(x[start:end], weights[n], bias=self.bias))
+            with _record_mole_nvtx_range("MOLE::linear", nvtx_enabled):
+                for n, mole_segment in enumerate(mole_intervals):
+                    interval_overlap = interval_intersection(
+                        input_segment, mole_segment
+                    )
+                    if interval_overlap is not None:
+                        start = interval_overlap[0] - ac_start_idx
+                        end = interval_overlap[1] - ac_start_idx
+                        out.append(F.linear(x[start:end], weights[n], bias=self.bias))
 
-        result = torch.concatenate(out, dim=0)
-        assert (
-            result.shape[0] == x.shape[0]
-        ), f"result shape {result.shape}, does not match input shape {x.shape} at dim 0"
-        return result
+            result = torch.concatenate(out, dim=0)
+            assert (
+                result.shape[0] == x.shape[0]
+            ), f"result shape {result.shape}, does not match input shape {x.shape} at dim 0"
+            return result
