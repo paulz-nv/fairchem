@@ -129,9 +129,6 @@ class EScAIPBackbone(nn.Module, BackboneInterface):
         # init weights
         self.init_weights()
 
-        # enable torch.set_float32_matmul_precision('high')
-        torch.set_float32_matmul_precision("high")
-
         # log recompiles
         torch._logging.set_logs(recompiles=True)  # type: ignore
 
@@ -355,7 +352,7 @@ class EScAIPEnergyHead(EScAIPHeadBase):
 
         energy_output = self.energy_layer(self.node_norm(emb["node_features"]))
 
-        # the following not compatible with torch.compile (grpah break)
+        # the following not compatible with torch.compile (graph break)
         # energy_output = torch_scatter.scatter(energy_output, node_batch, dim=0, reduce="sum")
 
         energy_output = compilable_scatter(
@@ -420,7 +417,7 @@ class EScAIPGradientEnergyForceStressHead(EScAIPEnergyHead):  # type: ignore
         else:
             energy_output = self.energy_layer(emb["node_features"])
 
-            # the following not compatible with torch.compile (grpah break)
+            # the following not compatible with torch.compile (graph break)
             # energy_output = torch_scatter.scatter(energy_output, node_batch, dim=0, reduce="sum")
 
             energy_output = compilable_scatter(

@@ -235,16 +235,180 @@ configs/                 # Hydra YAML configs (datasets, tasks, backbone, optimi
 
 ## Key Dependencies
 
-- `torch~=2.8.0`, `e3nn>=0.5` - PyTorch + equivariant neural networks
+- `torch~=2.13.0`, `e3nn>=0.5` - PyTorch + equivariant neural networks
 - `ase>=3.26.0` - Atomic Simulation Environment
 - `torchtnt` - PyTorch training framework (TrainUnit/EvalUnit)
 - `hydra-core` + `omegaconf` - Configuration management
 - `lmdb` - Dataset storage format
-- `ray[serve]>=2.53.0` - Distributed computing
+- Optional `ray` extra (`ray[serve]>=2.56.1`) - Distributed computing
 
-Anytime we learn something that could be beneficial in future coding sessions, automatically add it to CLAUDE.md.
+## Testing Gotchas
 
-This includes:
-- Gotchas that are not obvious
-- Subtle bugs that manifest under specific conditions
-- Repeat corrections I make to the output of coding agents
+- The canonical Ray Serve batching implementation is
+  `src/fairchem/core/components/batch_server.py`. During rebases, do not
+  resurrect the legacy `units/mlip_unit/_batch_serve.py`,
+  `units/mlip_unit/batch_server.py`, or `calculate/_batch_server.py` paths;
+  port their functional changes into the component instead.
+- Tests that download registered checkpoints must declare their models with a
+  `pretrained` marker. This lets base CI deselect them with `--exclude-models`
+  and routes them to the matching model-sweep job.
+- The core CI workflow uses explicit shard path lists rather than discovering
+  every directory under `tests/core`; add new test directories to the relevant
+  shard or CI will silently omit them.
+- External model tests intentionally run through the privileged `workflow_run`
+  path after `contributor check`, allowing approved PRs to access `HF_TOKEN`.
+  Keep `allow-unsafe-pr-checkout` paired with the repository's maintainer
+  approval gate, and include active targets such as `main` and `uma_dev` in the
+  contributor-check branch filter.
+- Branch-sync pushes authenticated with `GITHUB_TOKEN` do not trigger downstream
+  `push` workflows. Use a PAT or GitHub App token when a synchronized `uma_dev`
+  push must start its test workflow.
+- A workflow triggered by pushes to `main` must exist on `main`; keeping it only
+  on `uma_dev` will not make it run when `main` changes.
+- `fairchem_cpp` is optional in normal installations, but its supported source
+  builds must pass the required CPU/Python and GPU compatibility matrix. A CUDA
+  build request must fail if the toolkit or driver is unavailable; an
+  importable schema-only extension does not prove that the CUDA kernels exist.
+- Freeze inference parameters after inference-specific module replacement.
+  Main's folded-batch linear path removes the former general-backend regression:
+  on one H100, freezing improved compiled general inference by 15-17% and cut
+  peak allocated memory by 27-29% at 100-2,000 atoms. PyTorch 2.13 CPU checks
+  improved by 4% at 32 atoms and were neutral at 1,000 atoms. Custom backward
+  paths must preserve input derivatives independently of parameter gradients.
+- `umas_fast_gpu` custom backward operators do not implement `vmap` batching.
+  Compute Hessians through the per-component loop (`hessian_vmap=False`) when
+  exercising that backend, and ensure inference settings forward that option
+  into the backbone configuration.
+- Set `CI=true` when reproducing CPU CI shards locally. Some multi-GPU graph
+  parallel tests rely on that environment variable for skipping instead of the
+  `gpu` marker, so the CI marker expression alone will still collect them.
+- `graph_parallel_group_size=None` disables graph-parallel setup. A value of
+  `1` intentionally initializes singleton graph- and data-parallel groups and
+  is used to exercise those paths in tests; do not treat it as disabled.
+- Name-or-path checkpoint resolution belongs in
+  `pretrained_mlip.resolve_checkpoint` (registry names win over same-named
+  files). The batch server's `ModelSpec(source="auto")` is path-first instead,
+  so do not reroute its explicit `source` branches through the resolver
+  without reconciling that precedence.
+- Keep the full `AtomicData.clone()` boundary in prediction unless benchmarks
+  justify changing it and every model-side mutation has been audited. Graph
+  parallelism, MOLE preparation, and conservative gradients can replace or
+  mutate input fields, so a selective shallow copy is brittle.
+
+## Numerical Precision
+
+- Model constructors must not mutate process-wide PyTorch precision settings
+  such as `torch.set_float32_matmul_precision`. Precision is caller-owned;
+  inference applies TF32 temporarily through `InferenceSettings.tf32` and
+  restores the prior settings afterward.
+- TF32 policy belongs to the training/evaluation unit config or
+  `InferenceSettings.tf32`, never to a model config or model attribute.
+  Execution callers scope and restore the policy outside compiled `forward`
+  methods because precision getters cannot be traced by fullgraph.
+- Training and evaluation units default TF32 to disabled. Configs should set
+  `tf32` only when overriding that default. Hydra CLI overrides for configs
+  that omit the key must use the add syntax, such as
+  `+runner.train_eval_unit.tf32=true`.
+- Keep one configurable TF32 context manager for scoped matmul precision and
+  cuDNN state instead of introducing overlapping context managers.
+- Use the `tf32_context_manager` name for that policy; it controls both matmul
+  precision and cuDNN TF32, so `matmul_context` is too narrow.
+- Training FLOPs profiling invokes the model from `on_train_start`; scoped
+  execution settings must cover profiling as well as train/eval step methods.
+
+## Optimal Efficiency with UMA Nitro
+
+- Nitro's edge buffers hold the edge count measured on the first evaluation times
+  `EDGE_MARGIN` (`UMA_NITRO_EDGE_MARGIN`, default 1.30, in
+  `models/uma/uma_nitro/_inference.py`). A capacity overflow discards the cached
+  graph, remeasures and retries, which is slow. For optimal speed, this parameter needs to be tuned. Attempt tuning of this parameter for any inference speed benchmark of any UMA model that supports nitro.
+
+## Cluster Validation Gotchas
+
+- `torch.utils.collect_env.get_env_info()` runs multiple external tools without
+  subprocess timeouts. Do not invoke it directly on a distributed job's critical
+  startup path; isolate the collector and enforce a timeout.
+- PyTorch's environment collector can report no pip packages in environments
+  created without a `pip` executable, including isolated `uv` environments. Use
+  `importlib.metadata` inside the bounded collector process as the authoritative
+  package inventory.
+- In Slurm processes, prefer `SLURM_LOCALID` over `LOCAL_RANK`. Slurm's value is
+  authoritative, while an inherited `LOCAL_RANK` may be stale.
+- CLI telemetry must be installed in every launcher entry point. The top-level
+  CLI runs on the submission host for Slurm jobs, so compute-node reports belong
+  in direct-Slurm and Ray node entry points rather than only in `_cli.py`.
+- H100 compute nodes do not have PyPI egress. Provision Python environments on
+  the submission host before launching validation jobs.
+- Imports from home-backed virtual environments are extremely slow on H100
+  nodes. Copy complete environments and large checkpoints to node-local scratch
+  before running tests or benchmarks.
+- Pretrained checkpoints are cached under `~/.cache/fairchem`. Set
+  `HF_HUB_OFFLINE=1` in compute jobs to prevent blocked Hugging Face metadata
+  requests when the required files are already cached.
+- Separate Hugging Face downloads can populate different snapshots while
+  `refs/main` points only to the latest one. Ensure the active snapshot contains
+  every checkpoint needed by offline tests.
+- Core test collection imports benchmark and calculation modules through the
+  shared conftest. Validation environments need the `extras` dependencies,
+  including `pandas`, `pyarrow`, and `pymatgen`, even for focused test subsets.
+- Importing the benchmark package during core test collection can cause
+  `matbench_discovery` to download its WBM summary data. Cache that data before
+  running without Figshare access, or collection can fail before tests start.
+- A full executable documentation build reads the OC20NEB example trajectory.
+  Prefetch that file on the submission host and preserve the example's local
+  file guard before building on compute nodes, which do not have download
+  access.
+- Some GPU assertions are stochastic or tolerance-sensitive, and the complete
+  GPU matrix is expensive. Reproduce failures with the exact test node (and
+  repeat it when appropriate) before rerunning a full GPU shard.
+- Executable documentation runs notebooks from their source directories. Do
+  not rely on a fixed relative `chdir`; locate the repository root by a stable
+  marker such as `src/fairchem` instead.
+- MyST static builds configured with a `BASE_URL` must be reviewed through an
+  HTTP server at that same path prefix. Opening `index.html` directly can
+  trigger a redirect that does not resolve on the local filesystem.
+- Keep large documentation preview media remotely hosted when a stable source
+  URL exists, rather than adding duplicate binaries that increase repository
+  size.
+
+## Hessian Backend Gotchas
+
+- PyTorch's generic `vmap` fallback cannot batch the mutable, output-argument
+  Triton operators used by `umas_fast_gpu`. Backend validation rejects requested
+  Hessians with `hessian_vmap=True`; set it to `False` until the backward
+  operators have explicit batching rules. Automatic backend selection falls
+  back to normal mode for this combination. This only changes Hessian
+  construction: energy, force, and stress inference are unaffected. The
+  fallback computes one vector-Jacobian product per Cartesian force component,
+  so it can be slower for large systems while using less memory.
+- Explicit `torch.library.register_vmap` rules are possible for mutable custom
+  operators. A rule that loops over the mapped dimension would make the
+  operator compatible but retain most kernel-launch overhead. Recovering the
+  performance value of vectorized Hessians requires rules backed by genuinely
+  batched Triton kernels, including every custom backward operator reached by
+  the derivative graph.
+
+## Dependency Compatibility
+
+- Optional packages imported by eagerly loaded `fairchem.core` modules must use
+  a guarded import and `monty.dev.requires` on the feature entry point so the
+  base package remains importable without the optional dependency.
+- Slow-to-import packages (`ray`, `nvalchemiops`/`warp`, `wandb`) must not be
+  imported at module level outside modules dedicated to them. Check
+  availability with `importlib.util.find_spec` for the `requires` condition and
+  import the package inside the functions that use it.
+  `tests/core/test_imports.py` fails if they are imported eagerly.
+- `fairchem/core/__init__.py` and `fairchem/core/calculate/__init__.py` resolve
+  their exports lazily through a module `__getattr__`. Every `fairchem.core.*`
+  import runs the top-level `__init__`, so do not add eager imports there.
+- `pymatgen` and `pymatgen-core` are independently versioned. Slab tests must
+  not depend on enumeration order, seeded random coordinates, or atom counts
+  unless those values are part of the public contract; prefer composition,
+  Miller index, shift, placement, and cell invariants that survive upgrades.
+- Core compatibility variants are alternate builds of the `fairchem-core`
+  distribution and must keep their manifests synchronized with
+  `packages/fairchem-core/pyproject.toml`, except for their intentional
+  dependency pins. Use explicit source link farms rather than linking the
+  entire repository `src` directory: the base and NumPy 1.26 link farms must
+  not expose GemNet-OC at all, while only the Torch 2.12
+  `fairchem-core-geometric` link farm adds GemNet-OC and its PyG dependency.

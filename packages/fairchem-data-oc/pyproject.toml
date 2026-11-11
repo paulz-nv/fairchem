@@ -8,6 +8,7 @@ dynamic = ["version", "readme"]
 description = "Code for generating adsorbate-catalyst input configurations"
 license = {text = "MIT License"}
 dependencies = [
+    "fairchem-core>=2.20.0",  # first release with fairchem.core.common.safe_pickle
     "numpy>=2.0",
     "scipy>=1.15.0",
     "matplotlib",
@@ -18,7 +19,7 @@ dependencies = [
 
 [project.urls]
 repository = "https://github.com/facebookresearch/fairchem/tree/main/src/fairchem/data/oc"
-documentation = "https://fair-chem.github.io/"
+documentation = "https://facebookresearch.github.io/fairchem/"
 
 [tool.hatch.version]
 source = "vcs"

@@ -10,14 +10,18 @@ from __future__ import annotations
 import os
 import tempfile
 import uuid
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import clusterscope
 
+from fairchem.core.common.gp_utils import GraphParallelConfig
 from fairchem.core.common.utils import (
     StrEnum,
+    get_branch,
     get_commit_hash,
+    get_package_version,
     get_timestamp_uid,
 )
 
@@ -156,6 +160,15 @@ class Metadata:
     cluster_name: str
     array_job_num: int = 0
     slurm_env: SlurmEnv = field(default_factory=lambda: SlurmEnv())
+    # branch of the fairchem.core checkout, None for a released install or a
+    # detached HEAD; the commit above identifies the code either way
+    branch: Optional[str] = (
+        None  # omegaconf in python 3.9 does not backport annotations
+    )
+    # installed fairchem-core version, e.g. "2.21.1" or "2.21.1.dev50+gdfbfb7044"
+    version: Optional[str] = (
+        None  # omegaconf in python 3.9 does not backport annotations
+    )
 
 
 @dataclass
@@ -180,12 +193,36 @@ class JobConfig:
     metadata: Optional[Metadata] = (
         None  # omegaconf in python 3.9 does not backport annotations
     )
+    # Deprecated: use graph_parallel instead
     graph_parallel_group_size: Optional[int] = None
+    graph_parallel: GraphParallelConfig = field(
+        default_factory=lambda: GraphParallelConfig()
+    )
     # disable this if you want to lazily instantiate the runner later (for example: have a worker perform the instantiation after distributed env setup in SPMDWorker)
     recursive_instantiate_runner: bool = True
 
     def __post_init__(self) -> None:
         self.run_dir = os.path.abspath(self.run_dir)
+        if self.graph_parallel_group_size is not None:
+            if (
+                self.graph_parallel.group_size > 1
+                and self.graph_parallel.group_size != self.graph_parallel_group_size
+            ):
+                raise ValueError(
+                    "Cannot specify both graph_parallel_group_size and "
+                    "graph_parallel.group_size with different values. Use graph_parallel only."
+                )
+            if self.graph_parallel.group_size <= 1:
+                warnings.warn(
+                    "graph_parallel_group_size is deprecated, use graph_parallel instead",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                self.graph_parallel = replace(
+                    self.graph_parallel,
+                    group_size=self.graph_parallel_group_size,
+                )
+
         try:
             cluster = clusterscope.cluster()
         except RuntimeError:
@@ -205,4 +242,6 @@ class JobConfig:
                 PREEMPTION_STATE_DIR_NAME,
             ),
             cluster_name=cluster,
+            branch=get_branch(),
+            version=get_package_version(),
         )

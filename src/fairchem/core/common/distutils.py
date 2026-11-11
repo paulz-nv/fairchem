@@ -12,16 +12,20 @@ import os
 import subprocess
 import time
 from datetime import timedelta
+from importlib.util import find_spec
 from typing import Any, TypeVar
 
-import ray
 import torch
 import torch.distributed as dist
+from monty.dev import requires
 from torch.distributed.elastic.utils.distributed import get_free_port
 from torchtnt.utils.distributed import get_file_init_method, get_tcp_init_method
 
 from fairchem.core.common import gp_utils
 from fairchem.core.common.typing import none_throws
+
+# ray is slow to import, so it is imported where it is used.
+ray_installed = find_spec("ray") is not None
 
 T = TypeVar("T")
 DISTRIBUTED_PORT = 13356
@@ -121,7 +125,7 @@ def setup(config) -> None:
                 assign_device_for_local_rank(config["cpu"], local_rank)
 
                 dist.init_process_group(
-                    backend="nccl",
+                    backend=config["distributed_backend"],
                     init_method=init_method,
                     timeout=timeout,
                 )
@@ -173,8 +177,11 @@ def cleanup() -> None:
     time.sleep(0.5)  # Give OS time to release ports
 
 
+@requires(ray_installed, message="Requires `ray[serve]` to be installed")
 def cleanup_gp_ray():
     """Useful for cleaning up GP with ray"""
+    import ray
+
     if ray.is_initialized():
         ray.shutdown()
     cleanup()

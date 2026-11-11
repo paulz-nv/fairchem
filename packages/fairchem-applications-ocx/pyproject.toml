@@ -8,6 +8,7 @@ dynamic = ["version", "readme"]
 description = "Bridging Experiments to Computational Models"
 license = {text = "MIT License"}
 dependencies = [
+    "fairchem-core>=2.20.0",  # first release with fairchem.core.common.safe_pickle
     "numpy>=2.0,<2.4",
     "scipy>=1.15.0",
     "scikit-learn",
@@ -21,8 +22,8 @@ dependencies = [
 ]
 
 [project.urls]
-repository = "http://github.com/Fair-Chem/src/fairchem/applications/ocx"
-documentation = "https://fair-chem.github.io/"
+repository = "https://github.com/facebookresearch/fairchem/tree/main/src/fairchem/applications/ocx"
+documentation = "https://facebookresearch.github.io/fairchem/"
 
 [tool.hatch.version]
 source = "vcs"

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 
 import psutil
-from omdata.orca.calc import (
+from fairchem.data.omol.orca.calc import (
     NBO_FLAGS,
     OPT_PARAMETERS,
     ORCA_BASIS,
@@ -20,7 +20,7 @@ from omdata.orca.calc import (
     Vertical,
     get_symm_break_block,
 )
-from quacc.recipes.orca.core import run_and_summarize, run_and_summarize_opt
+from quacc.recipes.orca._base import run_and_summarize, run_and_summarize_opt
 
 
 def single_point_calculation(
@@ -53,7 +53,7 @@ def single_point_calculation(
     spin_multiplicity: int
         Multiplicity of the system
     xc: str
-        Exchange-correlaction functional
+        Exchange-correlation functional
     basis: str
         Basis set
     orcasimpleinput: list
@@ -69,11 +69,10 @@ def single_point_calculation(
     calc_kwargs:
         Additional kwargs for the custom Orca calculator
     """
-    from quacc import SETTINGS
+    if outputdir:
+        from quacc import SETTINGS
 
-    if outputdir is None:
-        outputdir = os.getcwd()
-    SETTINGS.RESULTS_DIR = outputdir
+        SETTINGS.RESULTS_DIR = outputdir
 
     if orcasimpleinput is None:
         orcasimpleinput = ORCA_SIMPLE_INPUT.copy()
@@ -138,7 +137,7 @@ def ase_relaxation(
     spin_multiplicity: int
         Multiplicity of the system
     xc: str
-        Exchange-correlaction functional
+        Exchange-correlation functional
     basis: str
         Basis set
     orcasimpleinput: list
@@ -158,11 +157,10 @@ def ase_relaxation(
     calc_kwargs:
         Additional kwargs for the custom Orca calculator
     """
-    from quacc import SETTINGS
+    if outputdir:
+        from quacc import SETTINGS
 
-    if outputdir is None:
-        outputdir = os.getcwd()
-    SETTINGS.RESULTS_DIR = outputdir
+        SETTINGS.RESULTS_DIR = outputdir
 
     if orcasimpleinput is None:
         orcasimpleinput = ORCA_SIMPLE_INPUT.copy()

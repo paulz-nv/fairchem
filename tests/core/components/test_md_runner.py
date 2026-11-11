@@ -18,9 +18,10 @@ import numpy as np
 import numpy.testing as npt
 import pandas as pd
 import pytest
-from ase import units
+from ase import Atoms, units
 from ase.build import bulk
 from ase.calculators.emt import EMT
+from ase.constraints import FixAtoms, FixCom, FixSubsetCom
 from ase.io import Trajectory
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.md.verlet import VelocityVerlet
@@ -34,6 +35,9 @@ from fairchem.core.components.calculate import (
     ParquetTrajectoryWriter,
     TrajectoryFrame,
     VelocityVerletThermostat,
+)
+from fairchem.core.components.calculate.simulation_tools.initialization import (
+    initialize_momenta,
 )
 
 
@@ -88,6 +92,94 @@ def results_dir():
 
 
 class TestMDRunner:
+    def test_initialize_momenta_is_reproducible(self):
+        """
+        Initial momenta use the requested seed and have no center-of-mass drift.
+        """
+        atoms1 = bulk("Cu", cubic=True) * (2, 2, 2)
+        atoms2 = atoms1.copy()
+
+        initialize_momenta(atoms1, temperature_K=300.0, seed=17)
+        initialize_momenta(atoms2, temperature_K=300.0, seed=17)
+
+        npt.assert_array_equal(atoms1.get_momenta(), atoms2.get_momenta())
+        npt.assert_allclose(atoms1.get_momenta().sum(axis=0), 0.0, atol=1e-12)
+        assert atoms1.info["velocity_seed"] == 17
+        assert atoms1.info["initial_temperature_K"] == 300.0
+
+    def test_initialize_momenta_rejects_single_mobile_atom(self):
+        atoms = Atoms("Cu")
+
+        with pytest.raises(ValueError, match="at least two mobile atoms"):
+            initialize_momenta(atoms, temperature_K=300.0, seed=17)
+
+        initialize_momenta(
+            atoms,
+            temperature_K=300.0,
+            seed=17,
+            remove_center_of_mass_momentum=False,
+        )
+        assert np.isfinite(atoms.get_momenta()).all()
+        assert not np.allclose(atoms.get_momenta(), 0.0)
+
+    def test_initialize_momenta_removes_mobile_subset_momentum(self):
+        atoms = bulk("Cu", cubic=True)
+        fixed = np.array([0, 1])
+        mobile = np.array([2, 3])
+        atoms.set_constraint(FixAtoms(indices=fixed))
+
+        initialize_momenta(atoms, temperature_K=300.0, seed=17)
+
+        momenta = atoms.get_momenta()
+        npt.assert_array_equal(momenta[fixed], 0.0)
+        npt.assert_allclose(momenta[mobile].sum(axis=0), 0.0, atol=1e-12)
+        assert np.isfinite(momenta).all()
+
+    @pytest.mark.parametrize(
+        ("velocity_seed", "initialization_temperature_K"),
+        [(17, None), (None, 300.0)],
+    )
+    def test_initialization_requires_seed_and_temperature(
+        self,
+        cu_atoms,
+        results_dir,
+        velocity_seed,
+        initialization_temperature_K,
+    ):
+        runner = MDRunner(
+            calculator=EMT(),
+            atoms=cu_atoms.copy(),
+            thermostat=VelocityVerletThermostat(),
+            steps=0,
+            velocity_seed=velocity_seed,
+            initialization_temperature_K=initialization_temperature_K,
+        )
+        runner._job_config = _create_mock_job_config(str(results_dir))
+
+        with pytest.raises(
+            ValueError,
+            match="velocity_seed and initialization_temperature_K must be set together",
+        ):
+            runner.calculate()
+
+    def test_initialization_is_not_repeated_after_resume(self, results_dir):
+        atoms = bulk("Cu", cubic=True) * (2, 2, 2)
+        atoms.set_momenta(np.zeros((len(atoms), 3)))
+        runner = MDRunner(
+            calculator=EMT(),
+            atoms=atoms,
+            thermostat=VelocityVerletThermostat(),
+            steps=1,
+            velocity_seed=17,
+            initialization_temperature_K=300.0,
+        )
+        runner._start_step = 1
+        runner._job_config = _create_mock_job_config(str(results_dir))
+
+        runner.calculate()
+
+        npt.assert_array_equal(runner._atoms.get_momenta(), np.zeros((len(atoms), 3)))
+
     def test_md_correctness_vs_ase(self, cu_atoms, results_dir):
         """
         Verify MDRunner produces identical trajectories to plain ASE.
@@ -143,6 +235,27 @@ class TestMDRunner:
                 row["energy"], ase_atoms.get_potential_energy(), atol=1e-10
             )
 
+    def test_langevin_fix_com_uses_mobile_subset(self):
+        atoms = bulk("Cu", cubic=True)
+        atoms.set_constraint(FixAtoms(indices=[0, 1]))
+        thermostat = LangevinThermostat(
+            temperature_K=300.0,
+            friction_per_fs=0.01,
+            use_fix_com_constraint=True,
+        )
+
+        dynamics = thermostat.build(atoms, timestep_fs=1.0)
+
+        assert dynamics.fix_com is False
+        constraints = [
+            constraint
+            for constraint in atoms.constraints
+            if isinstance(constraint, FixCom)
+        ]
+        assert len(constraints) == 1
+        assert isinstance(constraints[0], FixSubsetCom)
+        npt.assert_array_equal(constraints[0].get_indices(), [2, 3])
+
     @pytest.mark.parametrize(
         "thermostat",
         [
@@ -160,10 +273,19 @@ class TestMDRunner:
         ],
         ids=["VelocityVerlet", "NoseHoover", "Bussi", "Langevin", "BerendsenNPT"],
     )
-    def test_checkpoint_resume(self, cu_atoms, results_dir, thermostat):
+    @pytest.mark.parametrize(
+        "interrupt_at_step",
+        [36, 40],
+        ids=["non-aligned", "aligned"],
+    )
+    def test_checkpoint_resume(
+        self, cu_atoms, results_dir, thermostat, interrupt_at_step
+    ):
         """
-        Interrupt at a non-aligned step, checkpoint, resume, and verify
-        trajectory alignment across runs.
+        Checkpoint at both a non-aligned and an interval-aligned step, resume,
+        and verify the concatenated trajectory stays on a uniform grid with no
+        duplicated frames across the restart boundary (regardless of where
+        preemption lands relative to trajectory_interval).
         """
         results_dir1 = results_dir / "results1"
         results_dir2 = results_dir / "results2"
@@ -172,7 +294,6 @@ class TestMDRunner:
         results_dir2.mkdir()
 
         trajectory_interval = 10
-        interrupt_at_step = 36
         total_steps = 100
 
         runner1 = MDRunner(
@@ -221,7 +342,10 @@ class TestMDRunner:
 
         df1 = pd.read_parquet(parquet_file1)
         steps1 = list(df1["step"])
-        assert steps1 == [0, 10, 20, 30]
+        # Run 1 writes every interval-aligned step up to (and including) the
+        # interrupt step if that step is itself aligned.
+        expected_steps1 = list(range(0, interrupt_at_step + 1, trajectory_interval))
+        assert steps1 == expected_steps1
 
         # Verify checkpoint files
         assert (checkpoint_dir / "checkpoint.extxyz").exists()
@@ -254,7 +378,14 @@ class TestMDRunner:
         df2 = pd.read_parquet(results2["trajectory_file"])
         steps2 = list(df2["step"])
 
+        # No frame is written at the resume step, so the concatenated
+        # trajectory stays on a uniform grid with no duplicates, whether or not
+        # the checkpoint step was interval-aligned.
+        assert len(steps2) == len(set(steps2))
         all_steps = sorted(steps1 + steps2)
+        assert len(all_steps) == len(
+            set(all_steps)
+        ), f"Duplicate frame(s) across restart boundary: {all_steps}"
         expected = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
         assert all_steps == expected, f"Expected {expected}, got {all_steps}"
 

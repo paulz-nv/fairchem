@@ -8,7 +8,6 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import logging
-import os
 from collections import Counter
 from functools import partial
 from typing import TYPE_CHECKING, Literal
@@ -134,35 +133,29 @@ class FAIRChemCalculator(Calculator):
             name_or_path: A model name from fairchem.core.pretrained.available_models or a path to the checkpoint
                 file
             task_name: Task name
-            inference_settings: Settings for inference. Can be "default" (general purpose) or "turbo"
-                (optimized for speed but requires fixed atomic composition). Advanced use cases can
-                use a custom InferenceSettings object.
+            inference_settings: Settings for inference. "default" (the same as "nitro")
+                runs UMA Nitro for uma-s-1p2p1 and its fine-tunes on Nitro's
+                checkpoint allowlist on CUDA capability 8.x-12.x and "multigpu"
+                otherwise. "nitro" and "multigpu" are reduced-precision modes;
+                "multigpu" uses merge_mole + compile with TF32 matrix multiplies on
+                CUDA. "high-precision" uses merge_mole + compile in full FP32.
+                "multigpu" and "high-precision" fall back automatically if their
+                fixed-input contract is broken. "batch" keeps MOLE unmerged for
+                heterogeneous inputs. More advanced use cases can use a custom
+                InferenceSettings object.
             overrides: Optional dictionary of settings to override default inference settings.
             device: Optional torch device to load the model onto.
             seed: Random seed for reproducibility.
             workers: Number of parallel workers for prediction unit. Default is 1.
         """
 
-        if name_or_path in pretrained_mlip.available_models:
-            predict_unit = pretrained_mlip.get_predict_unit(
-                name_or_path,
-                inference_settings=inference_settings,
-                overrides=overrides,
-                device=device,
-                workers=workers,
-            )
-        elif os.path.isfile(name_or_path):
-            predict_unit = pretrained_mlip.load_predict_unit(
-                name_or_path,
-                inference_settings=inference_settings,
-                overrides=overrides,
-                device=device,
-                workers=workers,
-            )
-        else:
-            raise ValueError(
-                f"{name_or_path=} is not a valid model name or checkpoint path"
-            )
+        predict_unit = pretrained_mlip.get_predict_unit(
+            name_or_path,
+            inference_settings=inference_settings,
+            overrides=overrides,
+            device=device,
+            workers=workers,
+        )
         return cls(predict_unit=predict_unit, task_name=task_name, seed=seed)
 
     def check_state(self, atoms: Atoms, tol: float = 1e-15) -> list:
@@ -222,7 +215,7 @@ class FAIRChemCalculator(Calculator):
             raise ValueError("Atoms object has no atoms inside.")
 
         # Check if the atoms object has periodic boundary conditions (PBC) set correctly
-        if np.all(atoms.pbc) and np.allclose(atoms.cell, 0):
+        if np.all(np.asarray(atoms.pbc)) and np.allclose(atoms.cell, 0):
             raise AllZeroUnitCellError
 
         # Validate input data

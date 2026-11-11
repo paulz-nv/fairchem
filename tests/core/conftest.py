@@ -31,6 +31,7 @@ from fairchem.core.units.mlip_unit.mlip_unit import (
 )
 from tests.conftest import (
     excluded_models,
+    fixture_inference_settings,
     get_predict_unit_for_test,
     sweep_model,
     sweep_refs_from,
@@ -124,7 +125,7 @@ class ApproxExtension(AmberSnapshotExtension):
     if we have a snapshot with a float value of 0.1, and the actual value is 0.10000000000000001,
     then the strings will not match, even though the values are effectively equal.
 
-    To work around this, we override the serialize method to seralize the expected value
+    To work around this, we override the serialize method to serialize the expected value
     into a special representation. Then, we override the matches function (which originally does a
     simple string comparison) to parse the expected and actual values into numpy arrays.
     Finally, we compare the arrays using np.allclose.
@@ -174,6 +175,26 @@ def torch_deterministic():
     yield True  # Usability: prints `torch_deterministic=True` if a test fails
     # Tear down
     torch.use_deterministic_algorithms(False)
+
+
+@pytest.fixture()
+def torch_deterministic_warn():
+    # warn_only=True: for drift/consistency tests that want reduced nondeterminism
+    # but tolerate ops without a deterministic CUDA kernel (e.g. UMA-MoE's
+    # index_reduce_ in set_MOLE_coefficients, which would otherwise raise).
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    yield True
+    # Tear down (prevents leaking the global flag into later tests)
+    torch.use_deterministic_algorithms(False)
+
+
+@pytest.fixture(autouse=True)
+def _restore_determinism():
+    # Safety net: restore the global deterministic-algorithms flag after every
+    # test so an inline toggle in one test cannot leak into subsequent tests.
+    prev = torch.are_deterministic_algorithms_enabled()
+    yield
+    torch.use_deterministic_algorithms(prev)
 
 
 @pytest.fixture(scope="session")
@@ -417,7 +438,9 @@ def uma_predict_unit(request):
             "No UMA model available outside --exclude-models — sweep jobs "
             "should be used instead."
         )
-    return pretrained_mlip.get_predict_unit(candidates[0], device=device)
+    return pretrained_mlip.get_predict_unit(
+        candidates[0], device=device, inference_settings=fixture_inference_settings()
+    )
 
 
 @pytest.fixture(scope="session")
@@ -444,7 +467,9 @@ def uma_predict_unit_alt(request):
     if not candidates:
         pytest.skip("No UMA model available that differs from sweep model")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    return pretrained_mlip.get_predict_unit(candidates[0], device=device)
+    return pretrained_mlip.get_predict_unit(
+        candidates[0], device=device, inference_settings=fixture_inference_settings()
+    )
 
 
 @pytest.fixture(scope="module")

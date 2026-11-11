@@ -31,6 +31,22 @@ def _dummy_call(x):
     return x
 
 
+def _group_state():
+    return (
+        gp_utils.initialized(),
+        gp_utils.get_gp_world_size(),
+        gp_utils.get_dp_world_size(),
+    )
+
+
+def test_graph_parallel_size_one_initializes_groups():
+    config = PGConfig(backend="gloo", world_size=1, gp_group_size=1, use_gp=True)
+
+    output = spawn_multi_process(config, _group_state, init_pg_and_rank_and_launch_test)
+
+    assert output == [(True, 1, 1)]
+
+
 @pytest.mark.parametrize(
     "world_size, input, expected_output",
     [(1, 5, [5]), (3, 0, [0, 0, 0])],
@@ -377,7 +393,7 @@ def simple_layer(x, edge_index, node_offset, natoms, n=3):
         local_atoms = x.shape[0]
 
     # make sure different ddp ranks have different outputs
-    # similar to seeing diffferent data batches
+    # similar to seeing different data batches
     x_source = x_source + dp_rank * 0.1
     x_target = x_target + dp_rank * 0.1
 

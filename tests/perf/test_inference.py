@@ -62,7 +62,7 @@ class InferenceTestCase:
 
     Attributes:
         model: The name of the model to load.
-        device: The device to use use for inference requests.
+        device: The device to use for inference requests.
         structures: Each of the ASE atoms objects to use in inference requests.
     """
 
@@ -140,7 +140,7 @@ def test_pretrained_models(test_case, performance_report) -> None:
 
     # Setup the predictor
     predictor = get_predict_unit_for_test(
-        model_name=test_case.model,
+        name_or_path=test_case.model,
         device=test_case.device,
     )
 

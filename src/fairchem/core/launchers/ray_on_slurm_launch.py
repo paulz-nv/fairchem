@@ -8,25 +8,34 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import logging
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import clusterscope
 import hydra
-import ray
 import torch.distributed as dist
+from monty.dev import requires
 from omegaconf import OmegaConf
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.distributed.elastic.utils.distributed import get_free_port
+
+try:
+    import ray
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+    ray_installed = True
+except ImportError:
+    ray_installed = False
 
 from fairchem.core.common import gp_utils
 from fairchem.core.common.distutils import (
     assign_device_for_local_rank,
     setup_env_local_multi_gpu,
 )
+from fairchem.core.common.environment import write_environment_report
 from fairchem.core.common.utils import setup_env_vars
 from fairchem.core.components.runner import Runner
-from fairchem.core.launchers.api import DeviceType
+from fairchem.core.launchers.api import DeviceType, RunType
 from fairchem.core.launchers.cluster.ray_cluster import RayCluster
 
 if TYPE_CHECKING:
@@ -35,7 +44,18 @@ if TYPE_CHECKING:
     from fairchem.core.launchers.api import SchedulerConfig, SlurmConfig
 
 
-@ray.remote
+def write_ray_environment_report(job_config: DictConfig) -> None:
+    """
+    Write an environment report for a local or Slurm-backed Ray node.
+    """
+    write_environment_report(
+        log_dir=job_config.metadata.log_dir,
+        run_type=RunType.RUN.value,
+        timestamp_id=job_config.timestamp_id,
+        submission_commit=job_config.metadata.commit,
+    )
+
+
 class SPMDWorker:
     def __init__(
         self,
@@ -44,7 +64,7 @@ class SPMDWorker:
         worker_id: int,
         world_size: int,
         device: str,
-        gp_size: int | None = None,
+        gp_config=None,
         master_addr: str | None = None,
         master_port: int | None = None,
     ):
@@ -56,7 +76,7 @@ class SPMDWorker:
         self.master_port = get_free_port() if master_port is None else master_port
         self.worker_id = worker_id
         self.device = device
-        self.gp_size = gp_size
+        self.gp_config = gp_config
         self.world_size = world_size
         self.job_config = job_config
         setup_env_vars()
@@ -69,7 +89,7 @@ class SPMDWorker:
         master_address: str,
         master_port: int,
         device: str,
-        gp_size: int | None,
+        gp_config=None,
     ):
         setup_env_local_multi_gpu(worker_id, master_port, master_address)
         assign_device_for_local_rank(device == "cpu", 0)
@@ -79,8 +99,9 @@ class SPMDWorker:
             rank=worker_id,
             world_size=world_size,
         )
-        if gp_size is not None:
-            gp_utils.setup_graph_parallel_groups(gp_size, backend)
+        if gp_config is not None and gp_config.group_size > 1:
+            gp_utils.setup_graph_parallel_groups(gp_config.group_size, backend)
+            gp_utils.set_gp_config(gp_config)
 
     def get_master_address_and_port(self):
         return (self.master_address, self.master_port)
@@ -94,7 +115,7 @@ class SPMDWorker:
                 master_address=self.master_address,
                 master_port=self.master_port,
                 device=self.device,
-                gp_size=self.gp_size,
+                gp_config=self.gp_config,
             )
             self.runner: Runner = hydra.utils.instantiate(self.runner_config)
             self.runner.job_config = self.job_config
@@ -102,8 +123,17 @@ class SPMDWorker:
         self.runner.run()
 
 
+if ray_installed:
+    SPMDWorker = ray.remote(SPMDWorker)
+else:
+    SPMDWorker = requires(
+        ray_installed, message="Requires `ray[serve]` to be installed"
+    )(SPMDWorker)
+
+
 class SPMDController(Runner):
     # this is equivalent to the fairchem SlurmSPMDProgram routine that runs the runner on every worker
+    @requires(ray_installed, message="Requires `ray[serve]` to be installed")
     def __init__(self, job_config: DictConfig, runner_config: DictConfig):
         self.job_config = job_config
         self.runner_config = runner_config
@@ -111,7 +141,7 @@ class SPMDController(Runner):
         self.world_size = (
             job_config.scheduler.num_nodes * job_config.scheduler.ranks_per_node
         )
-        self.gp_group_size = job_config.graph_parallel_group_size
+        self.gp_config = job_config.graph_parallel
         self.ranks_per_node = job_config.scheduler.ranks_per_node
         self.num_nodes = job_config.scheduler.num_nodes
         num_gpus_per_group = (
@@ -142,7 +172,7 @@ class SPMDController(Runner):
             0,
             self.world_size,
             self.device,
-            self.gp_group_size,
+            self.gp_config,
             None,
             None,
         )
@@ -174,7 +204,7 @@ class SPMDController(Runner):
                     pg_idx * self.ranks_per_node + gpu_rank_on_node,
                     self.world_size,
                     self.device,
-                    self.gp_group_size,
+                    self.gp_config,
                     master_addr,
                     master_port,
                 )
@@ -192,6 +222,7 @@ class SPMDController(Runner):
         pass
 
 
+@requires(ray_installed, message="Requires `ray[serve]` to be installed")
 def ray_entrypoint(job_config: DictConfig, runner_config: DictConfig):
     runner = hydra.utils.instantiate(
         runner_config,
@@ -201,6 +232,7 @@ def ray_entrypoint(job_config: DictConfig, runner_config: DictConfig):
     runner.run()
 
 
+@requires(ray_installed, message="Requires `ray[serve]` to be installed")
 def ray_on_slurm_launch(config: DictConfig, log_dir: str):
     scheduler_config: SchedulerConfig = config.job.scheduler
     slurm_config: SlurmConfig = scheduler_config.slurm
@@ -214,7 +246,7 @@ def ray_on_slurm_launch(config: DictConfig, log_dir: str):
         "timeout_min": slurm_config.timeout_hr * 60,
         "mem_gb": slurm_config.mem_gb,
         "nodes": scheduler_config.num_nodes,
-        "gpus_per_task": scheduler_config.ranks_per_node,
+        "slurm_gpus_per_task": scheduler_config.ranks_per_node,
         "cpus_per_task": clusterscope.cpus(),  # need to request all the cpus on the node
         "tasks_per_node": 1,
     }
@@ -225,4 +257,5 @@ def ray_on_slurm_launch(config: DictConfig, log_dir: str):
         job_config=config.job,
         runner_config=config.runner,
         metrics_config=metrics_config,
+        node_start_callback=partial(write_ray_environment_report, config.job),
     )

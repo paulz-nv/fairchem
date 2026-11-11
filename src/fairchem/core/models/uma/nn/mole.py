@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+
+from .matmul import linear_with_folded_batch
 
 # MOLEDGL runs its per-segment GEMM through a backend chosen at construction:
 #   * "nvmath"       -> fairchem.core.common.segmentmm (cuBLAS via nvmath-python)
@@ -270,7 +271,11 @@ class MOLE(torch.nn.Module):
                     if interval_overlap is not None:
                         start = interval_overlap[0] - ac_start_idx
                         end = interval_overlap[1] - ac_start_idx
-                        out.append(F.linear(x[start:end], weights[n], bias=self.bias))
+                        out.append(
+                            linear_with_folded_batch(
+                                x[start:end], weights[n], bias=self.bias
+                            )
+                        )
 
             result = torch.concatenate(out, dim=0)
             assert (

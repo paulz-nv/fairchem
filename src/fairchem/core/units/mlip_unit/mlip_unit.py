@@ -37,13 +37,12 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.profiler import record_function
 from torchtnt.framework import EvalUnit, State, TrainUnit
-from torchtnt.utils.prepare_module import prepare_module
+from torchtnt.utils.prepare_module import DDPStrategy, prepare_module
 
 from fairchem.core.common import distutils, gp_utils
 from fairchem.core.common.distutils import (
     get_device_for_local_rank,
 )
-from fairchem.core.common.logger import WandBSingletonLogger
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import StrEnum
 from fairchem.core.components.train.train_runner import Checkpointable
@@ -58,7 +57,10 @@ from fairchem.core.units.mlip_unit._metrics import Metrics, get_metrics_fn
 from fairchem.core.units.mlip_unit.api.inference import (
     MLIPInferenceCheckpoint,
 )
-from fairchem.core.units.mlip_unit.utils import load_inference_model
+from fairchem.core.units.mlip_unit.utils import (
+    load_inference_model,
+    tf32_context_manager,
+)
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -406,7 +408,7 @@ def compute_metrics(
 def mt_collater_adapter(
     tasks: list[Task], exclude_keys: list[str] = DEFAULT_EXCLUDE_KEYS
 ):
-    # this is required because the MTCollater needs the old json formated task config so we need to convert it here
+    # this is required because the MTCollater needs the old json formatted task config so we need to convert it here
     task_config_old = {}
     tasks = filter_inference_only_tasks(tasks)
     for task in tasks:
@@ -529,6 +531,9 @@ class MLIPTrainEvalUnit(
         debug_checksums_save_path: str | None = None,
         profile_flops: bool = False,
         save_inference_ckpt: bool = True,
+        tf32: bool = False,
+        ddp_broadcast_buffers: bool = False,
+        ddp_gradient_as_bucket_view: bool = True,
     ):
         super().__init__()
         self.job_config = job_config
@@ -536,6 +541,7 @@ class MLIPTrainEvalUnit(
         self.tasks = filter_inference_only_tasks(tasks)
         self.profile_flops = profile_flops
         self.save_inference_ckpt = save_inference_ckpt
+        self.tf32 = tf32
 
         for task in self.tasks:
             if task.element_references is not None:
@@ -549,10 +555,13 @@ class MLIPTrainEvalUnit(
         self.finetune_model_full_config = getattr(
             model, "finetune_model_full_config", None
         )
-
         # call optimizer function between wrapping in DDP
         # this is required for models that have a no_weight_decay function
         self.optimizer = _get_optimizer_wd(optimizer_fn, model)
+
+        # Imported here so that importing this module (e.g. through the predict
+        # unit) does not import wandb.
+        from fairchem.core.common.logger import WandBSingletonLogger
 
         self.logger = (
             WandBSingletonLogger.get_instance()
@@ -594,7 +603,12 @@ class MLIPTrainEvalUnit(
         self.train_strategy = train_strategy
         if train_strategy == TrainStrategy.DDP:
             self.model = prepare_module(
-                model, device=torch.device(get_device_for_local_rank()), strategy="ddp"
+                model,
+                device=torch.device(get_device_for_local_rank()),
+                strategy=DDPStrategy(
+                    broadcast_buffers=ddp_broadcast_buffers,
+                    gradient_as_bucket_view=ddp_gradient_as_bucket_view,
+                ),
             )
             if self.ema_decay is not None:
                 self.ema_model = torch.optim.swa_utils.AveragedModel(
@@ -648,7 +662,9 @@ class MLIPTrainEvalUnit(
             raise ValueError(f"Unknown Training Strategy {train_strategy}")
 
         # setup eval unit, make it share the same model as this unit and turn off the logger
-        self.eval_unit = MLIPEvalUnit(job_config=job_config, model=None, tasks=tasks)
+        self.eval_unit = MLIPEvalUnit(
+            job_config=job_config, model=None, tasks=tasks, tf32=tf32
+        )
         eval_model = self.ema_model if self.ema_model is not None else self.model
         self.eval_unit.setup_train_eval_unit(eval_model)
 
@@ -691,7 +707,8 @@ class MLIPTrainEvalUnit(
             data = next(iter(state.train_state.dataloader)).to(
                 get_device_for_local_rank()
             )
-            flops = get_flops_profile(self.model, data, verbose=True)
+            with tf32_context_manager(self.tf32):
+                flops = get_flops_profile(self.model, data, verbose=True)
             num_atoms_local = data.natoms.sum().item()
             flops_per_atom_param = flops / self.num_params / num_atoms_local
             if self.logger:
@@ -744,22 +761,20 @@ class MLIPTrainEvalUnit(
                 + self.train_progress.num_steps_completed_in_epoch
                 / float(len(state.train_state.dataloader))
             )
-            with torch.autocast(
-                device_type=device,
-                enabled=self.autocast_enabled,
-                dtype=self.autocast_dtype,
-            ):
-                with _record_cuda_nvtx_range("forward"):
-                    pred = self.model.forward(batch_on_device)
-                with _record_cuda_nvtx_range("compute_loss"):
-                    loss_dict = compute_loss(self.tasks, pred, batch_on_device)
-            scalar_loss = sum(loss_dict.values())
-            self.optimizer.zero_grad()
-            with (
-                _record_cuda_nvtx_range("gradient-backward"),
-                record_function("backward"),
-            ):
-                scalar_loss.backward()
+            with tf32_context_manager(self.tf32):
+                with torch.autocast(
+                    device_type=device,
+                    enabled=self.autocast_enabled,
+                    dtype=self.autocast_dtype,
+                ):
+                    with _record_cuda_nvtx_range("forward"):
+                        pred = self.model.forward(batch_on_device)
+                    with _record_cuda_nvtx_range("compute_loss"):
+                        loss_dict = compute_loss(self.tasks, pred, batch_on_device)
+                scalar_loss = sum(loss_dict.values())
+                self.optimizer.zero_grad()
+                with _record_cuda_nvtx_range("gradient-backward"):
+                    scalar_loss.backward()
 
             if self.debug_checksums_save_path:
                 gp_size = 0
@@ -797,9 +812,7 @@ class MLIPTrainEvalUnit(
                         max_norm=self.clip_grad_norm,
                     )
 
-                if self.logger:
-                    self.logger.log({"train/grad_norm": grad_norm}, step=step)
-                self.last_grad_norm = float(grad_norm)
+                self.last_grad_norm = grad_norm.detach()
             self.optimizer.step()
             if self.ema_model is not None:
                 self.ema_model.update_parameters(self.model)
@@ -810,45 +823,60 @@ class MLIPTrainEvalUnit(
             self.previous_wall_time = time.time()
             num_atoms_local = data.natoms.sum().item()
             num_samples_local = data.natoms.numel()
-            log_dict = {
-                "train/loss": scalar_loss.item(),
-                "train/lr": self.scheduler.get_lr()[0],
-                "train/step": step,
-                "train/epoch": epoch,
-                "train/step_time_s": float(time_delta),
-                "train/samples_per_second(approx)": num_samples_local
-                * self.dp_world_size
-                / float(time_delta),
-                "train/atoms_per_second(approx)": num_atoms_local
-                * self.dp_world_size
-                / float(time_delta),
-                "train/num_atoms_on_rank": num_atoms_local,
-                "train/num_samples_on_rank": num_samples_local,
-            }
+            should_report = self.logger is not None or step % self.print_every == 0
+            # Keep metrics on-device until a logger or console report needs them.
+            self.last_loss = scalar_loss.detach()
 
-            if self.logger:
-                self.logger.log(log_dict, step=step, commit=True)
+            if should_report:
+                # Read all reported device scalars with one host synchronization.
+                report_tensors = [self.last_loss]
+                if self.last_grad_norm is not None:
+                    report_tensors.append(self.last_grad_norm)
+                report_values = torch.stack(report_tensors).tolist()
+                self.last_loss = report_values[0]
+                if self.last_grad_norm is not None:
+                    self.last_grad_norm = report_values[1]
 
-            if step % self.print_every == 0:
-                atoms_per_system = [int(value) for value in data.natoms.tolist()]
-                edges_per_system = [
-                    int(value)
-                    for value in data.get("generated_nedges", data.nedges).tolist()
-                ]
-                logging.info(
-                    {
-                        **log_dict,
-                        "train/num_systems": num_samples_local,
-                        "train/edges_per_system": edges_per_system,
-                        "train/total_atoms": num_atoms_local,
-                        "train/atoms_per_system": atoms_per_system,
-                    }
-                )
+                log_dict = {
+                    "train/loss": self.last_loss,
+                    "train/lr": self.scheduler.get_lr()[0],
+                    "train/step": step,
+                    "train/epoch": epoch,
+                    "train/step_time_s": float(time_delta),
+                    "train/samples_per_second(approx)": num_samples_local
+                    * self.dp_world_size
+                    / float(time_delta),
+                    "train/atoms_per_second(approx)": num_atoms_local
+                    * self.dp_world_size
+                    / float(time_delta),
+                    "train/num_atoms_on_rank": num_atoms_local,
+                    "train/num_samples_on_rank": num_samples_local,
+                }
+                if self.last_grad_norm is not None:
+                    log_dict["train/grad_norm"] = self.last_grad_norm
+
+                if self.logger:
+                    self.logger.log(log_dict, step=step, commit=True)
+
+                if step % self.print_every == 0:
+                    atoms_per_system = [int(value) for value in data.natoms.tolist()]
+                    edges_per_system = [
+                        int(value)
+                        for value in data.get(
+                            "generated_nedges", data.nedges
+                        ).tolist()
+                    ]
+                    logging.info(
+                        {
+                            **log_dict,
+                            "train/num_systems": num_samples_local,
+                            "train/edges_per_system": edges_per_system,
+                            "train/total_atoms": num_atoms_local,
+                            "train/atoms_per_system": atoms_per_system,
+                        }
+                    )
 
             self.scheduler.step()
-
-            # TODO: compute metrics
-            self.last_loss = scalar_loss.item()
         except Exception:
             logging.error(
                 f"Exception during training! On step {self.train_progress.num_steps_completed}"
@@ -966,6 +994,7 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
         model: torch.nn.Module,
         tasks: Sequence[Task],
         bf16: bool = False,
+        tf32: bool = False,
     ):
         """Evaluate your MLIPs and so forth.
 
@@ -974,10 +1003,12 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
             model: model to evaluate
             evaluations: a list of evaluation objects
             bf16: whether to use autocast with bf16
+            tf32: whether to use TF32 during evaluation
         """
         super().__init__()
         self.job_config = job_config
         self.model = model
+        self.tf32 = tf32
         self.tasks = filter_inference_only_tasks(tasks)
 
         for task in self.tasks:
@@ -995,6 +1026,9 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
             self.model = prepare_module(
                 model, device=torch.device(get_device_for_local_rank()), strategy="ddp"
             )
+
+        from fairchem.core.common.logger import WandBSingletonLogger
+
         self.logger = (
             WandBSingletonLogger.get_instance()
             if distutils.is_master()
@@ -1052,10 +1086,13 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
             )
             self.last_report = time.time()
 
-        with torch.autocast(
-            device_type=get_device_for_local_rank(),
-            enabled=self.autocast_enabled,
-            dtype=self.autocast_dtype,
+        with (
+            tf32_context_manager(self.tf32),
+            torch.autocast(
+                device_type=get_device_for_local_rank(),
+                enabled=self.autocast_enabled,
+                dtype=self.autocast_dtype,
+            ),
         ):
             t0 = time.time()
             preds = self.model(data)
@@ -1073,7 +1110,7 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
         for task in self.tasks:
             # This filters out all the datasets.splits that are in the current batch and
             # and are also included in the task. Remove the dataset.splits not in the task, since we
-            # wont compute metrics for those.
+            # won't compute metrics for those.
             # TODO overhaul the dataset names in task to avoid this filter?
             for dataset in filter(
                 lambda x: any(dset_name in x for dset_name in task.datasets),

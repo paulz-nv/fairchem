@@ -7,10 +7,14 @@ name = "fairchem-applications-adsorbml"
 dynamic = ["version", "readme"]
 description = "Module for calculating the minima adsorbtion energy"
 license = {text = "MIT License"}
+dependencies = [
+    "fairchem-core>=2.20.0",  # first release with fairchem.core.common.safe_pickle
+    "fairchem-data-oc",
+]
 
 [project.urls]
 repository = "https://github.com/facebookresearch/fairchem/tree/main/src/fairchem/applications/AdsorbML"
-documentation = "https://fair-chem.github.io/"
+documentation = "https://facebookresearch.github.io/fairchem/"
 
 [tool.hatch.version]
 source = "vcs"

@@ -315,7 +315,6 @@ class HydraInterfaceMixin:
 
         elif task.property == "hessian":
             regress_config.hessian = True
-            regress_config.hessian_vmap = True
             # Hessian requires forces with create_graph=True
             if not regress_config.direct_forces:
                 regress_config.forces = True
@@ -366,7 +365,7 @@ class HydraModel(nn.Module, HydraInterfaceMixin):
             assert isinstance(
                 starting_model, HydraModel
             ), "Can only finetune starting from other hydra models!"
-            # TODO this is a bit hacky to overrride attrs in the backbone
+            # TODO this is a bit hacky to override attrs in the backbone
             if "override" in finetune_config:
                 for key, value in finetune_config["override"].items():
                     setattr(starting_model.backbone, key, value)
@@ -388,6 +387,9 @@ class HydraModel(nn.Module, HydraInterfaceMixin):
             raise RuntimeError(
                 "Backbone not specified and not found in the starting checkpoint"
             )
+
+        # Propagate the generation id so the backbone can apply version-specific behavior.
+        self.backbone.model_id = self.model_id
 
         if freeze_backbone:
             for param in self.backbone.parameters():
