@@ -8,7 +8,7 @@ omat_forces_key: omat_forces
 odac_forces_key: odac_forces
 omc_forces_key: omc_forces
 
-max_atoms: 350
+max_atoms: 2000
 min_atoms: 0
 
 exclude_keys: [
